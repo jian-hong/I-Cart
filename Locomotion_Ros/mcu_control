@@ -1,0 +1,299 @@
+import rclpy
+from rclpy.node import Node
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from geometry_msgs.msg import Point
+from std_msgs.msg import Int32, Bool,UInt32
+from robocon_2025_interfaces.msg import Joystick, IMU
+import serial
+import time
+import math
+import struct
+
+UINT16_MAX = 65535
+
+class LocomotionControl(Node):
+    def __init__(self):
+        super().__init__('locomotion_control')
+
+        # inverse kinematics calculation constants
+        self.WHEEL_RADIUS = 0.075  # Wheel radius (m)
+        self.ROBOT_RADIUS = 0.285  # Distance from center to wheel (m)
+        self.RPM_CONVERSION_FACTOR = 60 / (2 * math.pi)  # To convert rad/s to RPM
+
+        self.MANUAL_POINT = 0
+        self.AUTONOMOUS_TRACKING = 1
+        
+        # Calculate angles (pi/4 increments for the 4 wheels)
+        # front left, front right, rear right, rear left
+        self.alphas = [3 * math.pi / 4, math.pi / 4, 7 * math.pi / 4, 5 * math.pi / 4]
+        self.direction_data = [0, 0, 0, 0]
+        self.speed_data = [0, 0, 0, 0]
+        self.wheel_speeds = [0, 0, 0, 0]  # To store w1, w2, w3, w4
+        self.acceleration = 0
+        self.theta = 0
+
+        # PID
+        self.Kp = 150
+        self.Ki = 20
+        self.Kd = 0
+
+        # PS4 button speed
+        self.button_speed = 2
+        
+        # Initialize serial port
+        self.header_byte = 0x59
+        self.serial_port = None
+        # Initialize serial port settings
+        self.SERIAL_PORT = '/dev/stm32'  # Change this to match your Arduino's serial port
+        self.BAUD_RATE = 115200
+        
+        self.send_data_size = 18
+        self.retrieve_data_size = 11
+        self.CRC_POLYNOMIAL = 0x1021
+        
+        self.attempt_to_connect()
+        
+        self.default_cbg = MutuallyExclusiveCallbackGroup()
+
+        self.brushless_erpm_publisher = self.create_publisher(Int32, 'brushless_erpm', 10)
+        self.dribble_timing_toggle_publisher = self.create_publisher(Bool, 'dribble_timing_toggle', 10)
+        self.dribble_timing_publisher = self.create_publisher(UInt32, 'dribble_timing', 10)
+        self.locomotion_subscription = self.create_subscription(Joystick, 'joystick_locomotion', self.locomotion_command_callback, 10,callback_group=self.default_cbg)
+        self.mechanism_subscription = self.create_subscription(Joystick, 'joystick_mechanism', self.mechanism_command_callback, 10,callback_group=self.default_cbg)
+        # self.imu_subscription = self.create_subscription(IMU, 'imu', self.imu_callback, 10)
+        self.subscription = self.create_subscription(Point, "ball_coordinates", self.camera_callback, 10,callback_group=self.default_cbg)
+        
+        self.create_timer(0.01, self.send_data,callback_group=self.default_cbg)
+        self.create_timer(0.005, self.retrieve_data,callback_group=self.default_cbg)
+
+        # Initialize variables
+        self.motor_command = []
+        self.locomotion_button = 0
+        self.mechanism_button = 0
+        self.detected = False
+        self.detection_mode = self.MANUAL_POINT
+
+        self.x_pixel = 0
+        self.y_pixel = 0
+        self.z_depth = 0
+        self.x_bytes = struct.pack('<H', UINT16_MAX)  # Little-endian float
+        self.y_bytes = struct.pack('<H', UINT16_MAX)
+        self.z_bytes = struct.pack('<H', UINT16_MAX)
+        
+        self.received_x = 0
+        self.received_y = 0
+        self.received_z = 0
+        
+        self.brushless_erpm = 0
+        self.dribble_timing_toggle = False
+        self.dribble_timing = 0
+    
+    def attempt_to_connect(self):
+        while True:
+            try:
+                self.serial_port = serial.Serial(self.SERIAL_PORT, self.BAUD_RATE, timeout=1)
+            except (OSError,serial.SerialException) as e:
+                self.get_logger().error(f"Serial communication error: {e}")
+            
+            if self.serial_port is not None:
+                self.get_logger().info(f'Successfully connected to {self.SERIAL_PORT}')
+                break
+
+            time.sleep(1)
+    # def get_input(self):
+    #     # input_data = [0, 0, 0]
+    #     if self.serial_port.in_waiting > 0:
+    #         input_data = self.serial_port.read(3)
+    #         # self.get_logger().info(f'Received data: {str(input_data[0])}, {str(input_data[1])}, {str(input_data[2])}')
+    #         if input_data[0] == self.header_byte and len(input_data) == 3:
+    #             # Process the received data
+    #             # self.get_logger().info("Header byte matched. Processing data...")
+    #             print("")
+
+    def send_data(self):
+        
+        msg = Int32()
+        msg.data = self.brushless_erpm
+        self.brushless_erpm_publisher.publish(msg)
+
+        msg = Bool()
+        msg.data = True if self.dribble_timing_toggle else False
+        self.dribble_timing_toggle_publisher.publish(msg)
+
+        msg = UInt32()
+        msg.data = self.dribble_timing
+        self.dribble_timing_publisher.publish(msg)
+        
+        if not self.serial_port.is_open:
+            self.attempt_to_connect()
+
+        if self.motor_command:
+            data = bytearray([self.header_byte])  # Start with the header byte
+            data = data + struct.pack('<B', self.locomotion_button) + struct.pack('<B', self.mechanism_button)
+            data.extend(speed.to_bytes(1, byteorder='big')[0] for speed in self.motor_command)  # Append each speed
+            data = data + self.x_bytes + self.y_bytes + self.z_bytes
+            crc = 0xFFFF
+            for idx in range(self.send_data_size):
+                crc ^= (data[idx] << 8)
+                for j in range(8):
+                    if (crc & 0x8000):
+                        crc = (crc << 1) ^ self.CRC_POLYNOMIAL
+                    else:
+                        crc <<= 1
+            crc &= 0xFFFF
+            data.extend(crc.to_bytes(2, byteorder="little"))  # Append crc 
+            # self.get_logger().info(f'Sending: {str(data[0])}, {str(data[1])}, {str(data[2])}, {str(data[3])}, {str(data[4])}, {str(data[5])}, {str(data[6])}, {str(data[7])}, {str(data[8])}, {str(data[9])}')
+                                    # {data[8]:x}, {data[9]:x}, {data[10]:x}, {data[11]:x}, {data[12]:x}, {data[13]:x}')
+            
+            try:
+                self.serial_port.write(data)
+                # self.get_logger().info(f'Sending: {data[1]}, {data[11]}, {data[12]}, {data[13]}, {data[14]}, {data[15]}, {data[16]}')
+            except (OSError,serial.SerialException):
+                self.attempt_to_connect()
+            
+            self.locomotion_button = 0
+            self.mechanism_button = 0
+        
+        # if self.serial_port.in_waiting > 0:
+        #     bytes_to_read = self.serial_port.in_waiting
+        #     input_data = self.serial_port.read(bytes_to_read)
+            # self.get_logger().info(f"{input_data}")
+
+    def retrieve_data(self):
+        try:
+            if self.serial_port.in_waiting > 0:
+                input_data = self.serial_port.read(self.serial_port.in_waiting)
+                receiving = False
+                collected_data = []
+                for idx in range(len(input_data)):
+                    byte = input_data[idx]
+                    if byte == self.header_byte or receiving:
+                        collected_data.append(byte)
+                        receiving = True
+
+                        if (len(collected_data) == self.retrieve_data_size):
+                            if self.crc_check(collected_data):
+                                self.brushless_erpm = collected_data[2] << 8 | collected_data[1]
+                                self.dribble_timing_toggle = collected_data[3]
+                                self.dribble_timing = collected_data[5] << 8 | collected_data[4]
+                                self.received_z = collected_data[8] << 8 | collected_data[7]
+                                
+                                # if self.received_x == self.x_pixel:
+                                #     self.x_bytes = struct.pack('<H', UINT16_MAX)  # Little-endian float
+                                # if self.received_y == self.y_pixel:
+                                #     self.y_bytes = struct.pack('<H', UINT16_MAX)
+                                # if self.received_z == self.z_depth:
+                                #     self.z_bytes = struct.pack('<H', UINT16_MAX)
+                                # self.get_logger().info(f"Command received by STM: {self.brushless_erpm}")
+                                receiving = False
+                                collected_data = []
+                            else:
+                                try:
+                                    collected_data = collected_data[collected_data.index(self.header_byte, 1):]
+                                except ValueError:
+                                    collected_data = []
+                                    receiving = False
+        except (OSError,serial.SerialException):
+            self.attempt_to_connect()
+    
+    def crc_check(self, collected_data):
+        crc = 0xFFFF
+        for idx in range(self.retrieve_data_size - 2):
+            crc ^= (collected_data[idx] << 8)
+            for j in range(8):
+                if (crc & 0x8000):
+                    crc = ((crc << 1) & 0xFFFF) ^ self.CRC_POLYNOMIAL
+                else:
+                    crc = (crc << 1) & 0xFFFF
+        received_crc = (collected_data[self.retrieve_data_size - 1] << 8) | collected_data[self.retrieve_data_size - 2]
+
+        return received_crc == crc
+    
+    def camera_callback(self, msg):
+        self.x_pixel = msg.x
+        self.y_pixel = msg.y
+        self.z_depth = int(msg.z * 100)
+        # Convert integer values to unsigned short integer in bytes (2 bytes each)
+        self.x_bytes = struct.pack('<H', int(self.x_pixel))  # Little-endian float
+        self.y_bytes = struct.pack('<H', int(self.y_pixel))
+        self.z_bytes = struct.pack('<H', int(self.z_depth))
+
+        if (msg.x == 0 and msg.y == 0 and msg.z == 0):
+            self.detected = False
+
+        else:
+            self.detected = True
+
+    def locomotion_command_callback(self, msg):
+
+        self.locomotion_button = msg.button
+        self.locomotion_button |= (self.detected << 7)
+        self.locomotion_button |= (self.detection_mode << 6)
+        
+        lateral_speed = -msg.lx / 100
+        forward_speed = -msg.ly / 100
+        robot_center_rpm = msg.rx
+
+        self.motor_command = []
+
+        # Convert center_rpm to angular velocity wz (rad/s)
+        wz = (2 * math.pi * robot_center_rpm) / 60
+
+        # Inverse kinematics formula for each wheel
+        for i, alpha in enumerate(self.alphas):
+            # Angular velocity of wheel i in rad/s, converted to RPM
+            self.wheel_speeds[i] = (1 / self.WHEEL_RADIUS) * (
+                -math.sin(self.theta + alpha) * lateral_speed
+                + math.cos(self.theta + alpha) * forward_speed
+                + self.ROBOT_RADIUS * wz
+            ) * self.RPM_CONVERSION_FACTOR  # Convert from rad/s to RPM
+        
+        if lateral_speed == 0 and forward_speed == 0 and robot_center_rpm == 0:
+            self.acceleration = 8
+        else:
+            self.acceleration = 2
+        self.motor_command.append(self.acceleration)
+        for idx in range(4):
+            # little-endian
+            self.motor_command.append(int(self.wheel_speeds[idx]) & 0xFF)
+            self.motor_command.append((int(self.wheel_speeds[idx]) & 0xFFFF) >> 8) # ensure bit 15 is the signed bit
+
+        # self.motor_command.append(self.Kp & 0xFF)
+        # self.motor_command.append((self.Kp & 0xFFFF) >> 8)
+        # self.motor_command.append(self.Ki)
+        # self.motor_command.append(self.Kd)
+
+        
+        # self.motor_command.append(0)
+        # self.motor_command.append(0)
+        # self.motor_command.append(0)
+        # self.motor_command.append(0)
+        # self.motor_command.append(0)
+        # self.motor_command.append(0)
+    
+    def mechanism_command_callback(self, msg):
+        self.mechanism_button = msg.button
+    
+    def imu_callback(self, msg):
+        # self.theta = (msg.yaw) * math.pi / 180
+        pass
+        
+    def __del__(self):
+        if self.serial_port.is_open:
+            self.serial_port.close()
+            self.get_logger().info("Serial port closed.")
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    locomotion_ctrl = LocomotionControl()
+    try:
+        rclpy.spin(locomotion_ctrl)
+    except KeyboardInterrupt:
+        pass
+    locomotion_ctrl.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
