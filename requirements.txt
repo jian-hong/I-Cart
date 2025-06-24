@@ -1,0 +1,9 @@
+# requirements.txt
+
+ultralytics
+transformers
+accelerate
+torch
+torchvision
+opencv-python
+ipywidgets # For notebook environments
